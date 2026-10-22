@@ -11,3 +11,6 @@ logs/
 *.env
 credentials*
 *token*
+.coverage
+htmlcov/
+coverage.xml
