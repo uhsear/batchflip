@@ -32,7 +32,7 @@ never be logged as success.
 Dry run by default. Only --apply writes. The token comes from the environment
 (ARCGIS_TOKEN by default), never from the command line.
 
-Exit codes: 0 done or check passed, 1 refused, 3 the apply failed part way,
+Exit codes: 0 done or check passed, 1 refused before any write, 3 the apply failed part way,
 64 usage error. (argparse itself exits 2 on an unknown or abbreviated flag.)
 """
 
@@ -42,6 +42,7 @@ import argparse
 import collections
 import csv
 import datetime
+import http.client
 import io
 import json
 import math
@@ -74,7 +75,7 @@ STATE_MIN_LENGTH = max(len(s) for s in STATES)
 
 REQUIRED_CAPS = ("Query", "Create", "Update", "Delete")
 # Esri documents the property as supportsRollbackOnFailureParameter; its own page
-# also shows supportsRollbackOnFailures. Either one set to false is honoured.
+# also shows supportsRollbackOnFailures. Either one set to false is noted.
 ROLLBACK_KEYS = ("supportsRollbackOnFailureParameter", "supportsRollbackOnFailures")
 
 T_STRING = "esriFieldTypeString"
@@ -86,9 +87,11 @@ T_FLOAT = frozenset(["esriFieldTypeSingle", "esriFieldTypeDouble"])
 GEOMETRY_KEYS = (("x", "esriGeometryPoint"), ("points", "esriGeometryMultipoint"),
                  ("paths", "esriGeometryPolyline"), ("rings", "esriGeometryPolygon"))
 
-IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
-BATCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,%d}$" % (BATCH_ID_MAX - 1))
+# \Z, not $: $ also matches before a trailing newline.
+IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+BATCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,%d}\Z" % (BATCH_ID_MAX - 1))
 LAYER_PATH_RE = re.compile(r"/FeatureServer/[0-9]+/?$")
+SERVICE_RE = re.compile(r"/[0-9]+$")
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
 
 
@@ -128,7 +131,8 @@ def http_json(url, params, retries):
             with urllib.request.urlopen(req, timeout=60) as resp:
                 text = resp.read().decode("utf-8", "replace")
             return json.loads(text)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            # HTTPException covers IncompleteRead (a reply cut off mid-body) and InvalidURL.
             last = exc
             if attempt < retries:
                 _SLEEP(2 * attempt)
@@ -174,6 +178,8 @@ def url_problem(url):
         return "layer URL must be http(s)://host/.../FeatureServer/<id>"
     if parts.scheme == "http" and parts.hostname not in LOOPBACK:
         return "layer URL uses plain http, which would send the token in the clear"
+    if "@" in parts.netloc:
+        return "layer URL must not carry a user name or password (it would be logged)"
     if parts.query or parts.fragment:
         return "layer URL must not carry a query string or fragment (a token there would be logged)"
     if not LAYER_PATH_RE.search(parts.path):
@@ -251,10 +257,14 @@ def _parse_csv(text):
     if len(set(n.lower() for n in names)) != len(names):
         raise SourceError("CSV header repeats a column name")
     rows = []
-    for number, row in enumerate(reader, 1):
-        if None in row or None in row.values():
-            raise SourceError("CSV row %d has a different number of cells than the header" % number)
-        rows.append(dict(row))
+    try:
+        for number, row in enumerate(reader, 1):
+            if None in row or None in row.values():
+                raise SourceError("CSV row %d has a different number of cells than the header"
+                                  % number)
+            rows.append(dict(row))
+    except csv.Error as exc:
+        raise SourceError("CSV source cannot be read: %s" % exc)
     return rows, [None] * len(rows)
 
 
@@ -284,8 +294,11 @@ def _by_name(props):
     return out
 
 
-def layer_checks(props, batch_field, state_field, allow_sync):
-    """The overwrite preconditions that need only the layer's own JSON.
+def layer_checks(props, batch_field, state_field, allow_sync, service=None):
+    """The overwrite preconditions that need only the layer JSON and the service JSON.
+
+    Esri documents syncEnabled on the feature service, not on the layer, so `service`
+    is the service root reply. A layer reply that carries it is honoured too.
 
     Returns (refusals, warnings). Each refusal stops the run before any write.
     """
@@ -300,16 +313,18 @@ def layer_checks(props, batch_field, state_field, allow_sync):
     if missing:
         refusals.append("layer capabilities lack: %s" % ", ".join(missing))
     if props.get("isView") is True:
-        refusals.append("layer is a view; a view cannot take these edits")
-    if props.get("syncEnabled") is True and not allow_sync:
+        refusals.append("layer is a view; Esri says a view cannot be overwritten, so this tool "
+                        "refuses it as a precaution")
+    synced = props.get("syncEnabled") is True or (service or {}).get("syncEnabled") is True
+    if synced and not allow_sync:
         refusals.append("sync is enabled on the layer; every flip would reach every replica "
                         "(pass --allow-sync to accept that)")
     for key in ("supportsPagination", "supportsAdvancedQueries"):
         if props.get(key) is False:
             refusals.append("layer reports %s=false, so the paged read cannot be trusted" % key)
     if any(props.get(key) is False for key in ROLLBACK_KEYS):
-        warnings.append("layer ignores rollbackOnFailure, so a failed call may leave a partial "
-                        "write; the post-flip count check still runs")
+        warnings.append("layer does not honour rollbackOnFailure; Esri says the service then "
+                        "treats it as true; the post-flip count check still runs")
     oid = props.get("objectIdField")
     if not (isinstance(oid, str) and oid.lower() in by_name):
         refusals.append("layer has no usable objectIdField")
@@ -329,6 +344,22 @@ def layer_checks(props, batch_field, state_field, allow_sync):
         if field.get("editable") is False:
             refusals.append("%s column %s is not editable" % (role, name))
     return refusals, warnings
+
+
+def _finite(value):
+    """True when every number inside value is finite. A huge int counts as not finite."""
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, int):
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            return False
+    if isinstance(value, (list, tuple)):
+        return all(_finite(v) for v in value)
+    if isinstance(value, dict):
+        return all(_finite(v) for v in value.values())
+    return True
 
 
 def coerce_cell(value, field, csv_mode):
@@ -356,7 +387,7 @@ def coerce_cell(value, field, csv_mode):
             return None, "not a whole number"
     elif ftype in T_FLOAT:
         if isinstance(value, bool) or not isinstance(value, (int, float)) \
-                or not math.isfinite(value):
+                or not _finite(value):
             return None, "not a finite number"
     elif ftype == T_STRING:
         if not isinstance(value, str):
@@ -367,7 +398,8 @@ def coerce_cell(value, field, csv_mode):
     return value, None
 
 
-def prepare_rows(props, rows, geoms, batch_field, state_field, csv_mode, allow_empty):
+def prepare_rows(props, rows, geoms, batch_field, state_field, csv_mode, allow_empty,
+                 allow_no_geometry=False):
     """Compare the source with the layer. Returns (problems, clean) where clean is a
     list of (attributes keyed by the layer's own field names, geometry or None)."""
     if not rows:
@@ -428,15 +460,23 @@ def prepare_rows(props, rows, geoms, batch_field, state_field, csv_mode, allow_e
     for (col, reason), (count, first) in sorted(bad.items()):
         problems.append("column %s: %d value(s) %s (first at row %d)" % (col, count, reason, first))
     layer_kind = props.get("geometryType")
-    unknown_geo = mismatch = 0
+    unknown_geo = mismatch = missing = nonfinite = 0
     for _attrs, geom in clean:
         if geom is None:
+            missing += 1
             continue
         kind = geometry_kind(geom)
         if kind is None:
             unknown_geo += 1
         elif kind != layer_kind:
             mismatch += 1
+        elif not _finite(geom):
+            nonfinite += 1
+    if missing and layer_kind and not allow_no_geometry:
+        problems.append("%d row(s) have no geometry, and the layer holds %s; a CSV has none "
+                        "(pass --allow-no-geometry to load them anyway)" % (missing, layer_kind))
+    if nonfinite:
+        problems.append("%d geometry value(s) hold a number that is not finite" % nonfinite)
     if unknown_geo:
         problems.append("%d geometry value(s) are not Esri JSON point, multipoint, "
                         "polyline or polygon" % unknown_geo)
@@ -632,6 +672,8 @@ def stage_rows(layer, features):
 
 def _abandon(layer, batch_id, stage, exc):
     """Remove a half-staged batch (readers never saw it) and build the FlipError."""
+    if not isinstance(exc, BatchflipError):
+        exc = "%s: %s" % (type(exc).__name__, exc)
     try:
         gone = delete_rows(layer, where_batch(layer, batch_id, STAGED))
         tail = "removed %d staged row(s) of the failed batch" % gone
@@ -669,14 +711,18 @@ def purge_retired(layer, log):
 
 def swap(layer, features, batch_id, old_oids, discard_staged, purge, log):
     if discard_staged:
-        log("  discarded %d staged row(s) from earlier runs"
-            % delete_rows(layer, where_state(layer, STAGED)))
+        try:
+            gone = delete_rows(layer, where_state(layer, STAGED))
+        except BatchflipError as exc:
+            raise FlipError("discard", "removing the staged leftovers failed: %s. Some of them "
+                            "may already be gone. Nothing new was staged" % exc)
+        log("  discarded %d staged row(s) from earlier runs" % gone)
     try:
         new_oids = stage_rows(layer, features)
         staged = fetch_count(layer, where_batch(layer, batch_id, STAGED))
         if staged != len(features):
             raise RestError("staged %d row(s) but the layer holds %d" % (len(features), staged))
-    except BatchflipError as exc:
+    except Exception as exc:  # any failure here leaves a half-staged batch to remove
         raise _abandon(layer, batch_id, "stage", exc)
     log("  staged %d row(s) as batch %s" % (len(new_oids), batch_id))
     finish_flip(layer, new_oids, old_oids, len(new_oids), log)
@@ -689,6 +735,18 @@ def swap(layer, features, batch_id, old_oids, discard_staged, purge, log):
 def _report(lines, stream=None):
     for line in lines:
         print(line, file=stream or sys.stdout)
+
+
+def _guarded(fn, *args):
+    """Run an apply step. Once writes may have started, no failure may end as exit 1
+    ('refused, nothing changed'), so an unexpected exception becomes a FlipError."""
+    try:
+        return fn(*args)
+    except BatchflipError:
+        raise
+    except Exception as exc:
+        raise FlipError("unexpected", "%s: %s. The table may be partly changed; look at it "
+                        "before you run again" % (type(exc).__name__, exc))
 
 
 def run(args, log=print):
@@ -712,8 +770,9 @@ def run(args, log=print):
 def _open_layer(args, token, log):
     """Read the layer JSON, run the layer preconditions, return (layer, props)."""
     props = call(args.layer_url, {}, token)
+    service = call(SERVICE_RE.sub("", args.layer_url.rstrip("/")), {}, token)
     refusals, warnings = layer_checks(props, args.batch_field, args.state_field,
-                                      args.allow_sync)
+                                      args.allow_sync, service)
     if refusals:
         raise BatchflipError("; ".join(refusals))
     by_name = _by_name(props)
@@ -737,7 +796,7 @@ def _run(args, token, log):
         return _recover(args, layer, live_rows, log)
     rows, geoms, kind = read_source(args.source)
     problems, clean = prepare_rows(props, rows, geoms, layer.batch, layer.state,
-                                   kind == "csv", args.allow_empty)
+                                   kind == "csv", args.allow_empty, args.allow_no_geometry)
     batch_id = args.batch_id or default_batch_id(_NOW())
     problems += state_refusals(
         live_rows, layer, staged_count, fetch_count(layer, where_invalid(layer)),
@@ -753,10 +812,17 @@ def _run(args, token, log):
             % (len(clean), len(live_rows)))
         return EXIT_OK
     log("=== APPLY ===")
-    swap(layer, stage_features(clean, layer, batch_id), batch_id,
-         oid_list(live_rows, layer.oid), args.discard_staged, args.purge, log)
+    _guarded(swap, layer, stage_features(clean, layer, batch_id), batch_id,
+             oid_list(live_rows, layer.oid), args.discard_staged, args.purge, log)
     log("Done.")
     return EXIT_OK
+
+
+def _recover_apply(args, layer, staged_rows, old, expected_live, log):
+    finish_flip(layer, oid_list(staged_rows, layer.oid), oid_list(old, layer.oid),
+                expected_live, log)
+    if args.purge:
+        purge_retired(layer, log)
 
 
 def _recover(args, layer, live_rows, log):
@@ -774,10 +840,8 @@ def _recover(args, layer, live_rows, log):
         log("Re-run with --apply to finish the flip.")
         return EXIT_OK
     log("=== APPLY ===")
-    finish_flip(layer, oid_list(staged_rows, layer.oid), oid_list(old, layer.oid),
-                len(live_keep) + len(staged_rows), log)
-    if args.purge:
-        purge_retired(layer, log)
+    _guarded(_recover_apply, args, layer, staged_rows, old, len(live_keep) + len(staged_rows),
+             log)
     log("Done.")
     return EXIT_OK
 
@@ -808,6 +872,8 @@ def build_parser():
                     help="after the flip, delete every retired row")
     ap.add_argument("--allow-empty", action="store_true",
                     help="allow a source with no rows (this empties the table)")
+    ap.add_argument("--allow-no-geometry", action="store_true",
+                    help="allow rows with no geometry in a layer that has a geometry type")
     ap.add_argument("--allow-sync", action="store_true",
                     help="allow a layer that has sync enabled")
     ap.add_argument("--token-env", default="ARCGIS_TOKEN",
@@ -830,6 +896,7 @@ def main(argv=None):
 
 _BASE = "/arcgis/rest/services/T/FeatureServer/0"
 _TOKEN = "tok-S3CRET-91"
+_ROOT = _BASE[:-2]
 _HOST = "https://h.example/arcgis/rest/services/T/FeatureServer/0"
 
 
@@ -853,6 +920,13 @@ def _stub_props(table=False):
     return props
 
 
+class _Cut(object):
+    """A canned reply that promises 500 bytes, sends five and hangs up."""
+
+
+_CUT = _Cut()
+
+
 class _Stub(object):
     """An in-memory stand-in for one hosted layer, driven over real HTTP.
 
@@ -862,6 +936,7 @@ class _Stub(object):
 
     def __init__(self):
         self.props = _stub_props()
+        self.service = {"syncEnabled": False}
         self.rows = []
         self.geoms = {}
         self.next_oid = 1
@@ -911,7 +986,7 @@ class _Stub(object):
         return next((r for r in self.rows if r["OBJECTID"] == oid), None)
 
     def handle(self, path, params):
-        op = path[len(_BASE):].strip("/") or "layer"
+        op = "service" if path.rstrip("/") == _ROOT else path[len(_BASE):].strip("/") or "layer"
         self.counts[op] = self.counts.get(op, 0) + 1
         self.requests.append((op, dict(params)))
         if self.http_fail > 0:
@@ -922,12 +997,15 @@ class _Stub(object):
             return 200, canned
         if self.token and params.get("token") != self.token:
             return 200, {"error": {"code": 498, "message": "Invalid token."}}
-        ops = {"layer": self.op_layer, "query": self.op_query, "applyEdits": self.op_apply,
-               "deleteFeatures": self.op_delete}
+        ops = {"layer": self.op_layer, "service": self.op_service, "query": self.op_query,
+               "applyEdits": self.op_apply, "deleteFeatures": self.op_delete}
         return 200, ops[op](params)
 
     def op_layer(self, params):
         return self.props
+
+    def op_service(self, params):
+        return self.service
 
     def op_query(self, params):
         hits = [r for r in self.rows if self.match(params["where"], r)]
@@ -986,6 +1064,13 @@ def _serve(stub):
             params = dict((k, v[0]) for k, v in
                           urllib.parse.parse_qs(raw, keep_blank_values=True).items())
             status, body = stub.handle(self.path, params)
+            if body is _CUT:
+                self.send_response(200)
+                self.send_header("Content-Length", "500")
+                self.end_headers()
+                self.wfile.write(b'{"err')
+                self.close_connection = True
+                return
             data = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -1069,6 +1154,11 @@ def _t_core(check, raises):
           "a url that is not a feature layer is refused")
     check("http(s)" in url_problem("ftp://h.example/a/FeatureServer/0"), "a non-http scheme is refused")
     check("http(s)" in url_problem(""), "an empty url is refused")
+    check("user name or password" in url_problem("https://bob:pw@h.example/a/FeatureServer/0"),
+          "a url with a user name and password is refused  <-- pinned defect")
+    check("user name or password" in url_problem("https://@h.example/a/FeatureServer/0"),
+          "a url with an empty user name is refused")
+    check(DEFAULT_CHUNK == 500 and DEFAULT_PAGE == 1000, "the default chunk is 500 and the default page is 1000")
 
 
 def _t_source(check, raises, tmp):
@@ -1097,6 +1187,8 @@ def _t_source(check, raises, tmp):
     raises(lambda: parse_source("A,a\n1,2\n", "csv"), "a csv header that repeats a name raises", SourceError)
     raises(lambda: parse_source("A,B\n1,2,3\n", "csv"), "a csv row with extra cells raises", SourceError)
     raises(lambda: parse_source("A,B\n1\n", "csv"), "a csv row with missing cells raises", SourceError)
+    raises(lambda: parse_source("A\n" + "x" * 140000 + "\n", "csv"),
+           "a csv cell over the reader limit raises SourceError, not csv.Error  <-- pinned defect", SourceError)
 
     def path(name, data):
         full = os.path.join(tmp, name)
@@ -1109,6 +1201,8 @@ def _t_source(check, raises, tmp):
     rows, geoms, kind = read_source(path("ok.json", b'[{"NAME": "x"}]'))
     check(kind == "json" and rows == [{"NAME": "x"}], "read_source reads a .json file")
     raises(lambda: read_source(path("bad.txt", b"x")), "an unknown extension raises", SourceError)
+    raises(lambda: read_source(path("valid.txt", b'[{"NAME": "x"}]')),
+           "a .txt file is refused even when it holds valid JSON", SourceError)
     raises(lambda: read_source(os.path.join(tmp, "missing.csv")), "a missing file raises", SourceError)
     raises(lambda: read_source(path("bin.csv", b"\xff\xfe\x00\x80")),
            "a file that is not utf-8 raises", SourceError)
@@ -1122,7 +1216,7 @@ def _t_layer(check):
 
     def checks(p, **kw):
         return layer_checks(p, kw.get("batch", "batch_id"), kw.get("state", "batch_state"),
-                            kw.get("sync", False))
+                            kw.get("sync", False), kw.get("service"))
 
     check(checks(props()) == ([], []), "a well formed layer passes every precondition")
     check(checks(props(), batch="BATCH_ID")[0] == [], "column names match without regard to case")
@@ -1136,6 +1230,11 @@ def _t_layer(check):
     check("view" in checks(props(isView=True))[0][0], "a view is refused")
     check("sync is enabled" in checks(props(syncEnabled=True))[0][0], "a sync enabled layer is refused")
     check(checks(props(syncEnabled=True), sync=True)[0] == [], "--allow-sync accepts a sync enabled layer")
+    check("sync is enabled" in checks(props(), service={"syncEnabled": True})[0][0],
+          "a sync enabled service is refused, which is where Esri documents the property")
+    check(checks(props(), service={"syncEnabled": True}, sync=True)[0] == [],
+          "--allow-sync accepts a sync enabled service")
+    check(checks(props(), service={"syncEnabled": "yes"})[0] == [], "only a true syncEnabled counts")
     check("supportsPagination" in checks(props(supportsPagination=False))[0][0],
           "a layer without paging is refused")
     check("supportsAdvancedQueries" in checks(props(supportsAdvancedQueries=False))[0][0],
@@ -1180,6 +1279,8 @@ def _t_layer(check):
     check(coerce_cell(1, dbl, False) == (1, None), "an integer fits a double field")
     check(coerce_cell(float("inf"), dbl, False)[1] == "not a finite number", "infinity is refused")
     check(coerce_cell(True, dbl, False)[1] == "not a finite number", "a boolean is not a double")
+    check(coerce_cell(10 ** 400, dbl, False)[1] == "not a finite number",
+          "an integer too big for a double is refused, not a traceback  <-- pinned defect")
     check(coerce_cell("a", dbl, False)[1] == "not a finite number", "text is not a double in json mode")
     check(coerce_cell("1.5", dbl, True) == (1.5, None), "csv text becomes a double")
     check(coerce_cell("x", dbl, True)[1] == "not a number", "csv text that is not a number is named")
@@ -1206,15 +1307,18 @@ def _t_layer(check):
 def _t_rows(check):
     props = _stub_props()
     good = [_feat(1)["attributes"], _feat(2)["attributes"]]
-    geo = [{"x": 1, "y": 1}, None]
+    geo = [{"x": 1, "y": 1}, {"x": 2, "y": 2}]
 
-    def prep(rows, geoms=None, p=None, csv_mode=False, empty=False):
-        return prepare_rows(p or props, rows, geoms or [None] * len(rows),
-                            "batch_id", "batch_state", csv_mode, empty)
+    def prep(rows, geoms=None, p=None, csv_mode=False, empty=False, no_geo=False):
+        p = p or props
+        fill = {"x": 1, "y": 1} if p.get("geometryType") else None
+        return prepare_rows(p, rows, geoms or [fill] * len(rows),
+                            "batch_id", "batch_state", csv_mode, empty, no_geo)
 
     problems, clean = prep(good, geo)
     check(problems == [] and len(clean) == 2, "a matching source passes")
-    check(clean[0][0]["CODE"] == 1 and clean[1][1] is None, "clean rows keep their values and geometry")
+    check(clean[0][0]["CODE"] == 1 and clean[1][1] == {"x": 2, "y": 2},
+          "clean rows keep their values and geometry")
     problems, clean = prep([{"name": "a", "code": 1}])
     check(problems == [] and clean[0][0] == {"NAME": "a", "CODE": 1},
           "source columns are renamed to the layer's own field names")
@@ -1242,6 +1346,26 @@ def _t_rows(check):
     problems, _ = prep(good, [{"x": 1, "y": 1}, {"rings": []}])
     check("1 geometry value(s) do not match the layer's esriGeometryPoint" in problems[0],
           "a polygon into a point layer is refused  <-- pinned defect")
+    problems, _ = prep(good, [None, None])
+    check(problems == ["2 row(s) have no geometry, and the layer holds esriGeometryPoint; a CSV has "
+                       "none (pass --allow-no-geometry to load them anyway)"],
+          "rows with no geometry are refused for a point layer  <-- pinned defect")
+    problems, _ = prep([{"CODE": 1}], csv_mode=True, geoms=[None])
+    check("1 row(s) have no geometry" in problems[0], "a csv into a point layer is refused  <-- pinned defect")
+    problems, clean = prep(good, [None, {"x": 2, "y": 2}], no_geo=True)
+    check(problems == [] and clean[0][1] is None, "--allow-no-geometry accepts rows with no geometry")
+    problems, _ = prep(good, [{"x": 1, "y": float("inf")}, {"x": 2, "y": 2}])
+    check(problems == ["1 geometry value(s) hold a number that is not finite"],
+          "a geometry coordinate that is not finite is refused  <-- pinned defect")
+    problems, _ = prep(good, [{"rings": [[[0, 0], [1e999, 1]]]}, geo[1]])
+    check("do not match" in problems[0] and len(problems) == 1,
+          "a polygon into a point layer is a mismatch, not a second finite-number problem")
+    poly = _stub_props()
+    poly["geometryType"] = "esriGeometryPolygon"
+    ring = {"spatialReference": {"wkid": 4326, "wkt": "w"}, "rings": [[[0, 0], [float("inf"), 1]]]}
+    problems, _ = prep(good, [ring, {"rings": [[[0, 0], [1, 1]]]}], p=poly)
+    check(problems == ["1 geometry value(s) hold a number that is not finite"],
+          "an infinite coordinate nested in a polygon is refused")
     table = _stub_props(table=True)
     problems, _ = prep(good, geo, p=table)
     check("table (no geometry)" in problems[0], "geometry into a table is refused")
@@ -1313,6 +1437,14 @@ def _t_rows(check):
     except RestError:
         raises_oid = True
     check(raises_oid, "a row with no object id raises")
+    raises_oid = False
+    try:
+        oid_list([{"OBJECTID": True}], "OBJECTID")
+    except RestError:
+        raises_oid = True
+    check(raises_oid, "a boolean object id raises")
+    check(len(edit_failures({"addResults": [{"success": "false"}, {"success": 1}]}, "addResults", 2)) == 2,
+          "a success that is not exactly true is a failure")
 
     # ---- arguments
     base = ["--layer-url", _HOST]
@@ -1334,6 +1466,15 @@ def _t_rows(check):
           "a batch id over 40 characters is refused")
     check("--chunk must be" in arg_problems(_args(*base + ["--source", "a", "--chunk", "0"]))[0],
           "a chunk of 0 is refused")
+    check(arg_problems(_args(*base + ["--source", "a", "--chunk", "1"])) == [], "a chunk of 1 is accepted")
+    check(arg_problems(_args(*base + ["--source", "a", "--batch-id", "x" * 40])) == [],
+          "a batch id of 40 characters is accepted")
+    check("--batch-id must be" in arg_problems(_args(*base + ["--source", "a", "--batch-id", "B1\n"]))[0],
+          "a batch id that ends in a newline is refused  <-- pinned defect")
+    check("--batch-id must be" in arg_problems(_args(*base + ["--source", "a", "--batch-id", "_lead"]))[0],
+          "a batch id that starts with an underscore is refused")
+    check("--state-field must be" in arg_problems(_args(*base + ["--source", "a", "--state-field", "s\n"]))[0],
+          "a field name that ends in a newline is refused")
     check("--state-field must be a plain" in arg_problems(_args(*base + ["--source", "a", "--state-field", "a b"]))[0],
           "a field name with a space is refused")
     check("must differ" in arg_problems(_args(*base + ["--source", "a", "--state-field", "BATCH_ID"]))[0],
@@ -1350,7 +1491,8 @@ def _t_rows(check):
 
 def _t_net(check, tmp):
     """Everything below talks real HTTP to the stub on 127.0.0.1."""
-    global _SLEEP, _NOW
+    global _SLEEP, _NOW, plan_flip
+    real_plan = plan_flip
     stub = _Stub()
     server, thread = _serve(stub)
     url = "http://127.0.0.1:%d%s" % (server.server_address[1], _BASE)
@@ -1444,6 +1586,22 @@ def _t_net(check, tmp):
         check(call(url, {}, "")["type"] == "Feature Layer" and "token" not in stub.requests[-1][1],
               "no token parameter is sent when there is no token")
         stub.token = _TOKEN
+        for k in (1, 2, 3):
+            stub.canned[("layer", stub.calls("layer") + k)] = _CUT
+        failed = None
+        try:
+            call(url, {}, _TOKEN)
+        except RestError as exc:
+            failed = str(exc)
+        check(failed is not None and "IncompleteRead" in failed and "after 3 attempt(s)" in failed,
+              "a reply cut off mid-body is a failure, not a traceback  <-- pinned defect")
+        failed = None
+        try:
+            call(url + " x", {}, _TOKEN)
+        except RestError as exc:
+            failed = str(exc)
+        check(failed is not None and "after 3 attempt(s)" in failed,
+              "a url that http.client rejects is a failure, not a traceback")
 
         # ---- direct reads and edits
         stub.reset(5, "R", LIVE)
@@ -1459,6 +1617,14 @@ def _t_net(check, tmp):
         rows = fetch_rows(layer, where_state(layer, LIVE), ["OBJECTID"])
         check(len(rows) == 5 and stub.calls("query") == base_q + 2 + 3,
               "a read pages through maxRecordCount rows at a time")
+        stub.canned[("query", stub.calls("query") + 1)] = {"count": 3}
+        failed = None
+        try:
+            fetch_rows(layer, where_state(layer, LIVE), ["OBJECTID"])
+        except RestError as exc:
+            failed = str(exc)
+        check(failed is not None and "read 4 row(s) but the count query says 3" in failed,
+              "a read that returns more rows than the count says stops the run")
         stub.canned[("query", stub.calls("query") + 1)] = {"count": "five"}
         failed = None
         try:
@@ -1521,8 +1687,12 @@ def _t_net(check, tmp):
 
         # ---- purge
         mark = stub.calls("deleteFeatures")
+        start = len(stub.requests)
         code, out, err = cli("--layer-url", url, "--source", src3, "--batch-id", "B3", "--chunk", "4",
                              "--purge", "--apply")
+        deletes = [p for op, p in stub.requests[start:] if op == "deleteFeatures"]
+        check(len(deletes) == 3 and all(p.get("rollbackOnFailure") == "true" for p in deletes),
+              "every delete asks for rollbackOnFailure=true")
         check(code == 0 and stub.number(RETIRED) == 0 and stub.number(LIVE, "B3") == 3 and len(stub.rows) == 3,
               "--purge removes every retired row after the flip")
         check(stub.calls("deleteFeatures") - mark == 3 and "purged 10 retired" in out,
@@ -1556,9 +1726,18 @@ def _t_net(check, tmp):
         code, out, err = cli("--layer-url", url, "--source", src3, "--allow-sync")
         check(code == 0 and writes() == mark, "--allow-sync lets the check run pass")
         del stub.props["syncEnabled"]
+        stub.service["syncEnabled"] = True
+        refused(["--source", src3], "sync is enabled", "a sync enabled service is refused")
+        mark = writes()
+        code, out, err = cli("--layer-url", url, "--source", src3, "--allow-sync")
+        check(code == 0 and writes() == mark, "--allow-sync lets a sync enabled service pass the check")
+        stub.service["syncEnabled"] = False
+        stub.canned[("service", stub.calls("service") + 1)] = {"error": {"code": 403, "message": "no access"}}
+        refused(["--source", src3], "no access", "a service root that cannot be read refuses before any write")
         stub.props["supportsRollbackOnFailureParameter"] = False
         code, out, err = cli("--layer-url", url, "--source", src3)
-        check(code == 0 and "warning: layer ignores rollbackOnFailure" in out, "a layer that ignores rollback warns")
+        check(code == 0 and "warning: layer does not honour rollbackOnFailure" in out
+              and "treats it as true" in out, "a layer that does not honour rollback is noted")
         del stub.props["supportsRollbackOnFailureParameter"]
         stub.truncate_at = 2
         refused(["--source", src3], "read 2 row(s) but the count query says 3",
@@ -1603,6 +1782,9 @@ def _t_net(check, tmp):
         mark = writes()
         code, out, err = cli("--layer-url", "http://h.example/a/FeatureServer/0", "--source", src3)
         check(code == 64 and "plain http" in err and writes() == mark, "plain http to a remote host is a usage error")
+        code, out, err = cli("--layer-url", "https://bob:hunter2pw@h.example/a/FeatureServer/0", "--source", src3)
+        check(code == 64 and "user name or password" in err and "hunter2pw" not in out + err and writes() == mark,
+              "a password in the layer url is a usage error and is never printed  <-- pinned defect")
         code, out, err = cli("--source", src3)
         check(code == 64 and "http(s)" in err, "a missing layer url is a usage error")
         os.environ["ARCGIS_TOKEN"] = ""
@@ -1630,6 +1812,19 @@ def _t_net(check, tmp):
               "the default batch id comes from the clock")
         stub.props = _stub_props()
 
+        # ---- rows the layer would store without a shape
+        stub.reset(3, "B3")
+        csv_pt = src("pt.csv", "NAME,CODE\na,1\n")
+        refused(["--source", csv_pt, "--apply"], "have no geometry",
+                "a csv into a point layer refuses and keeps the live rows  <-- pinned defect")
+        check(stub.number(LIVE, "B3") == 3, "the live rows survive that refusal")
+        code, out, err = cli("--layer-url", url, "--source", csv_pt, "--batch-id", "G1", "--allow-no-geometry", "--apply")
+        check(code == 0 and stub.number(LIVE, "G1") == 1 and stub.geoms[stub.rows[-1]["OBJECTID"]] is None,
+              "--allow-no-geometry loads the rows with no shape on request")
+        refused(["--source", src("inf.json", '[{"attributes": {"CODE": 1}, "geometry": {"x": 1e999, "y": 1}}]'),
+                 "--apply"], "not finite",
+                "a coordinate that overflows to infinity refuses before any write  <-- pinned defect")
+
         # ---- faults while writing
         def fault(call_no, reply, args, label, needle, rows_after, code_want=3):
             stub.reset(0)
@@ -1652,6 +1847,39 @@ def _t_net(check, tmp):
               ["--source", src7, "--batch-id", "F2", "--chunk", "3", "--apply"],
               "a failed row in the second add call is reported and the first call is removed",
               "1019 bad geometry; removed 3 staged row(s) of the failed batch", 0)
+
+        fault(2, _CUT, ["--source", src7, "--batch-id", "F8", "--chunk", "3", "--apply"],
+              "a reply cut off mid-body while staging exits 3 and removes the staged rows  <-- pinned defect",
+              "IncompleteRead", 0)
+        stub.reset(0)
+        stub.props = _stub_props(table=True)
+        stub.props["fields"].append({"name": "GID", "type": "esriFieldTypeGUID", "editable": True,
+                                     "nullable": True})
+        nan_src = src("nan.json", '[{"CODE": 1}, {"CODE": 2}, {"CODE": 3}, {"CODE": 4, "GID": 1e999}]')
+        code, out, err = cli("--layer-url", url, "--source", nan_src, "--batch-id", "F9", "--chunk", "3", "--apply")
+        check(code == 3 and "FAILED at stage: ValueError" in err and "removed 3 staged" in err and not stub.rows,
+              "an unexpected error while staging removes the staged rows and exits 3  <-- pinned defect")
+        stub.props = _stub_props()
+        stub.reset(0)
+
+        def boom(*_args):
+            raise ZeroDivisionError("planned")
+
+        plan_flip = boom
+        code, out, err = cli("--layer-url", url, "--source", src3, "--batch-id", "F10", "--apply")
+        plan_flip = real_plan
+        check(code == 3 and "FAILED at unexpected: ZeroDivisionError" in err and "partly changed" in err,
+              "an unexpected error after the first write exits 3, not 1  <-- pinned defect")
+
+        # a --discard-staged that fails part way
+        stub.reset(3, "B3")
+        stub.seed(4, "LEFT", STAGED)
+        stub.canned[("deleteFeatures", stub.calls("deleteFeatures") + 2)] = {"error": {"code": 500, "message": "boom"}}
+        code, out, err = cli("--layer-url", url, "--source", src3, "--batch-id", "D1", "--chunk", "2",
+                             "--discard-staged", "--apply")
+        check(code == 3 and "FAILED at discard" in err and "may already be gone" in err
+              and "Nothing was changed" not in err and stub.number(STAGED) == 2 and stub.number(LIVE, "B3") == 3,
+              "a --discard-staged that fails part way exits 3 and says rows may be gone  <-- pinned defect")
 
         # cleanup that also fails leaves staged rows, and the next run says so
         stub.reset(0)
@@ -1681,6 +1909,12 @@ def _t_net(check, tmp):
         code, out, err = cli("--layer-url", url, "--source", src3, "--batch-id", "F6", "--chunk", "4", "--apply")
         check(code == 3 and "FAILED at verify: expected 3 live row(s) after the flip, found 1" in err,
               "a live count that does not match after the flip is a failure  <-- pinned defect")
+        stub.reset(0)
+        q = stub.calls("query")
+        stub.canned[("query", q + 6)] = {"count": 5}
+        code, out, err = cli("--layer-url", url, "--source", src3, "--batch-id", "F11", "--chunk", "4", "--apply")
+        check(code == 3 and "expected 3 live row(s) after the flip, found 5" in err,
+              "a live count that is too high after the flip is a failure  <-- pinned defect")
         stub.reset(0)
         q = stub.calls("query")
         stub.canned[("query", q + 6)] = {"error": {"code": 500, "message": "gone"}}
@@ -1725,7 +1959,7 @@ def _t_net(check, tmp):
         server.shutdown()
         server.server_close()
         thread.join()
-        _SLEEP, _NOW = saved[0], saved[1]
+        _SLEEP, _NOW, plan_flip = saved[0], saved[1], real_plan
         for key, value in (("NO_PROXY", saved[2]), ("ARCGIS_TOKEN", saved[3])):
             os.environ.pop(key, None)
             os.environ.update(dict([(key, value)] if value is not None else []))

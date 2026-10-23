@@ -45,15 +45,18 @@ What already exists, and what it does well:
   needs the same fields, the same file type and the same file name as the original upload.
   Prefer it when a short outage is fine and you publish from a file.
 - **Upsert append** (`FeatureLayer.append(upsert=True, upsert_matching_field=KEY)`) is the better
-  answer when your rows have a stable key. There is no empty moment and no extra column. Pair it
-  with [hostedreap](https://github.com/uhsear/hostedreap), which deletes the rows that left the source.
+  answer when your rows have a stable key. It updates matching rows and adds the rest, so the table
+  is never emptied, and it needs no extra column. The matching field must have a unique index
+  ([ArcGIS API for Python, `FeatureLayer.append`](https://developers.arcgis.com/python/latest/api-reference/arcgis.features.toc.html)).
+  Pair it with [hostedreap](https://github.com/uhsear/hostedreap), which deletes the rows that left the source.
 - **A filtered hosted view.** Esri lets you "filter a view's contents by defining filter
   expressions" ([Create hosted feature layer views](https://doc.arcgis.com/en/arcgis-online/manage-data/create-hosted-views.htm)).
   A view filtered on `batch_state = 'live'` gives every reader the filter without asking each one
   to add it. It works well beside this tool.
 - **Other scripts.** `gh search repos` on 2026-10-22 found update scripts such as
   [py3-portal-hosted-layer-updater](https://github.com/stratosigma/py3-portal-hosted-layer-updater).
-  I did not review them, and I did not find one that stages a batch beside the live one.
+  I did not review them, and I did not find one that stages a batch beside the live one. A search
+  for the name `batchflip` on 2026-10-23 found only this repository.
 
 ## Self-test
 
@@ -72,16 +75,20 @@ PASS  a prefix --appl of a flag is REFUSED by the parser  <-- pinned defect
 PASS  a write is sent once and never retried  <-- pinned defect
 PASS  an error object in an HTTP 200 reply is a failure  <-- pinned defect
 ...
+PASS  a reply cut off mid-body is a failure, not a traceback  <-- pinned defect
+...
 PASS  a layer that cuts a page short refuses  <-- pinned defect
+...
+PASS  a --discard-staged that fails part way exits 3 and says rows may be gone  <-- pinned defect
 ...
 PASS  the token is in no stdout or stderr from any run  <-- pinned defect
 ...
 --------------------------------------------------------------------
-232 assertions, 0 failed
+271 assertions, 0 failed
 ```
 
-The count is 232 on Windows (Python 3.13.2) and on Linux (Python 3.12.3). The two full outputs are
-the same, line for line (the Windows file ends its lines with CRLF). Branch coverage is 100 percent (1281 statements, 310 branches):
+The count is 271 on Windows (Python 3.13.2) and on Linux (Python 3.12.3). The two full outputs are
+the same, line for line (the Windows file ends its lines with CRLF). Branch coverage is 100 percent (1444 statements, 332 branches):
 
 ```
 coverage run --branch batchflip.py --self-test
@@ -134,7 +141,13 @@ reads a view that has that filter.
 - `.json`: Esri JSON. Either `{"features": [{"attributes": {...}, "geometry": {...}}]}`, a list
   of those features, or a list of flat attribute objects. `NaN` and `Infinity` are refused ("NaN in JSON raises", "Infinity in JSON raises").
 - `.csv`: one header row, text cells. The tool converts each cell to the layer's field type. An
-  empty cell is NULL. Dates must be whole numbers of epoch milliseconds.
+  empty cell is NULL. Dates must be whole numbers of epoch milliseconds. A CSV has no geometry.
+
+A layer with a geometry type refuses a row that has no geometry, so a CSV fits a table but not a
+point, line or polygon layer. Without that check the swap would retire every shape and leave only
+rows with no shape. Pass `--allow-no-geometry` if you want that. A source in Esri JSON that has no
+`geometry` key is treated the same way. An Esri JSON export that includes `OBJECTID` is refused
+as "not editable". Remove that column first.
 
 Column names match the layer without regard to case, and the tool writes them with the layer's
 own spelling.
@@ -146,14 +159,15 @@ own spelling.
 | `--layer-url` | none | The feature layer, ending in `/FeatureServer/<id>`. https only (http only for 127.0.0.1). No query string. |
 | `--source` | none | New rows, `.json` or `.csv`. Give this or `--recover`. |
 | `--recover BATCH` | off | Finish an interrupted flip. Promotes the staged rows of BATCH and retires every other live row. |
-| `--batch-id` | UTC timestamp | Id of the new batch. 1 to 40 of letters, digits, `_`, `.`, `-`. |
+| `--batch-id` | UTC timestamp | Id of the new batch. 1 to 40 of letters, digits, `_`, `.`, `-`. The first character is a letter or digit. |
 | `--batch-field`, `--state-field` | `batch_id`, `batch_state` | The two columns. |
 | `--chunk` | `500` | Rows per `applyEdits` call. This is a choice of this tool, not a service limit. |
-| `--discard-staged` | off | Delete staged rows left by an earlier failed run, then continue. |
+| `--discard-staged` | off | Delete every staged row in the table (any batch), then continue. |
 | `--purge` | off | After the flip, delete every retired row. |
 | `--allow-empty` | off | Accept a source with no rows. This empties the table. |
+| `--allow-no-geometry` | off | Accept rows with no geometry in a layer that has a geometry type. |
 | `--allow-sync` | off | Accept a layer that has sync enabled. |
-| `--token-env` | `ARCGIS_TOKEN` | The environment variable that holds the token. |
+| `--token-env` | `ARCGIS_TOKEN` | The NAME of the environment variable that holds the token, never the token itself. |
 | `--apply` | off | Write. Without it the tool only reads. |
 | `--self-test` | off | Run the offline assertions and the stub server, then exit. |
 
@@ -163,7 +177,9 @@ the environment only, so it never sits in a process listing or a shell history.
 
 Exit codes: `0` done or check passed, `1` refused (nothing was changed), `3` a write failed part
 way (the message says where and how to finish), `64` usage error. The parser itself exits `2` for
-an unknown or abbreviated flag.
+an unknown or abbreviated flag. Exit `1` also covers a layer that could not be reached or read, so
+read the message to tell a failed precondition from a failed read. An error that the tool did not
+expect, once the first write may have gone out, exits `3`, not `1`.
 
 ## The overwrite preconditions (ovwcheck)
 
@@ -176,9 +192,9 @@ same kind of check before it writes. A failed check stops the run before the fir
 | "The same fields and feature classes ... must be present in the updated file" | Refuses a source column that the layer does not have, and a required layer field that the source lacks. |
 | "the schema in the source file must be the same" | Checks every cell against the field type (whole number, number, text, date as epoch milliseconds), the string length and `nullable`. It reports counts by column, with the first bad row. |
 | "The file name must be the same as the original file name." | Not applicable. No file is published. |
-| "You must be the owner of the hosted feature layer or a member of the default administrator role." | Not checked. The owner is on the item, not on the layer URL. A token without edit rights fails the capability check or the first write. |
-| The option is unavailable for "a hosted feature layer view" | Refuses a layer with `isView: true`. |
-| The option is unavailable when "Synchronization is enabled" | Refuses a layer with `syncEnabled: true`, unless you pass `--allow-sync`. |
+| "You must be the owner of the hosted feature layer or a member of the default administrator role." | Not checked. The owner is on the item, not on the layer URL. The capability check reads the `capabilities` that the layer reports. I did not test a token whose account lacks edit rights. |
+| The option is unavailable for "a hosted feature layer view" | Refuses a layer with `isView: true`. That is a precaution drawn from the overwrite page, which says a view cannot be overwritten. Some views accept edits. |
+| The option is unavailable when "Synchronization is enabled" | Reads the feature service root and refuses `syncEnabled: true`, unless you pass `--allow-sync`. A layer reply that carries `syncEnabled: true` is refused too. |
 | The option is unavailable when "You enabled data change tracking on the layer." | Not checked. I could not confirm the layer JSON property from the REST pages. |
 
 Checks that come from the REST pages, not from the overwrite page:
@@ -186,16 +202,21 @@ Checks that come from the REST pages, not from the overwrite page:
 - The layer lists `Query`, `Create`, `Update` and `Delete` in `capabilities`
   ([Feature layer](https://developers.arcgis.com/rest/services-reference/enterprise/feature-layer/)).
 - Paging: `resultOffset` "only applies if `supportsPagination` is `true`", and `orderByFields`
-  "requires `supportsAdvancedQueries` to be `true`"
+  "is supported on only those layers/tables that indicate `supportsAdvancedQueries` is `true`"
   ([Query](https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/)).
   A layer that says `false` for either is refused.
 - The geometry in the source must match `geometryType` (point, multipoint, polyline, polygon),
-  and a table takes none.
+  every coordinate must be finite, and a table takes none. A layer that has a geometry type
+  refuses rows with no geometry unless you pass `--allow-no-geometry`.
 - No two batches may be live, no leftover staged rows may exist, and the new batch id must be new.
 - The source must have rows, unless you pass `--allow-empty`.
 
-`isView`, `syncEnabled` and `defaultValue` are read from the layer JSON when present. The Feature
-layer page does not define them. A missing property counts as "not set".
+`syncEnabled` is documented on the
+[Feature service](https://developers.arcgis.com/rest/services-reference/enterprise/feature-service/)
+page, so the tool reads the service root, which is one more read-only call. `isView` and
+`defaultValue` are read from the layer JSON when present. The Feature layer page does not define
+them, and I could not confirm the name `isView` against a live service. A missing property counts as
+"not set".
 
 ## Reading the reply
 
@@ -211,8 +232,11 @@ treats all of these as failure:
 - any result whose `success` is not exactly `true`;
 - a staged row that comes back without an integer `objectId`.
 
-`rollbackOnFailure` is `true` on every write. The page says it defaults to `true`, and that a layer
-may ignore it when `supportsRollbackOnFailureParameter` is `false`. The tool warns in that case.
+`rollbackOnFailure` is `true` on every write, on `applyEdits` and on `deleteFeatures`. The page says
+it defaults to `true`. When the layer property `supportsRollbackOnFailureParameter` is `false`,
+Esri says the service treats `rollbackOnFailure` "as if it were set to true, regardless of the
+input". The Feature layer page shows the same property as `supportsRollbackOnFailures`, so the tool
+reads both names. The tool notes the `false` case and still counts the live rows after the flip.
 Deletes go by `objectIds`, so each deleted row has its own result
 ([Delete features](https://developers.arcgis.com/rest/services-reference/enterprise/delete-features/)).
 
@@ -223,7 +247,8 @@ every row twice. Reads are tried up to three times.
 
 | Where | What the tool does | What you do |
 |---|---|---|
-| While staging | Removes the staged rows of that batch (readers never saw them) and exits `3`. | Fix the cause and run again. |
+| Before staging, with `--discard-staged` | Exits `3` and says some leftovers may already be gone. Nothing new was staged. | Run again with a new batch id. |
+| While staging | Removes the staged rows of that batch (readers never saw them) and exits `3`. This includes a reply that is cut off mid-body and an error the tool did not expect. | Fix the cause and run again. |
 | The cleanup also fails | Says so and leaves the staged rows. The next run refuses and names them. | Run with `--discard-staged`. |
 | While promoting or retiring | Exits `3`. Readers may see both batches. | Run `--recover BATCH --apply`. It promotes what is left and retires the old batch. |
 | The live count differs after the flip | Exits `3` with both numbers. | Look at the layer before you run again. |
@@ -248,7 +273,10 @@ labels are the PASS lines of `--self-test`.
 | Recovery | "--recover promotes what is left and retires the old batch", "--recover with --purge retires and removes the old batch" |
 | Refusals change nothing | the `refused` checks, one per refusal, each asserting that the write count did not move |
 | CSV into a table | "csv rows reach a hosted table as typed values and NULLs" |
-| The checks fail when the code is wrong | I broke twelve controls by hand (error object, write retry, abbreviations, count reconcile, live count, promote order, retire loop, token, empty source, rollback flag, objectId check, `NaN`). The self-test went red each time. |
+| A cut-off reply, a password in the URL and a CSV into a point layer are handled | "a reply cut off mid-body while staging exits 3 and removes the staged rows", "a password in the layer url is a usage error and is never printed", "a csv into a point layer refuses and keeps the live rows" |
+| Every delete asks for `rollbackOnFailure=true` | "every delete asks for rollbackOnFailure=true" |
+| A live count that is too high or too low after the flip fails the run | "a live count that is too high after the flip is a failure", "a live count that does not match after the flip is a failure" |
+| The checks fail when the code is wrong | I broke controls by hand, one at a time, and the self-test went red each time: error object, write retry, abbreviations, objectId check, `NaN`, the rollback flag on `applyEdits` and on `deleteFeatures`, the live count test (both directions), the extra-rows test in the read, the cut-off reply handler, the URL password check, the no-geometry check, the infinity check, the `--discard-staged` handler, the unexpected-error handler, the CSV reader limit and the newline in a field name. This was a manual sweep, not a script in this repo. I did not re-run it for the count reconcile, promote order, retire loop, empty source or token print controls after the last change. |
 
 Not exercised against a real service: everything listed under Limits.
 
@@ -267,7 +295,6 @@ Not exercised against a real service: everything listed under Limits.
   in between are not detected, except through the live count after the flip.
 - **Not carried over:** attachments, related records, global ids and editor tracking values.
   New rows get new object ids.
-- **Spatial reference is not compared.** Geometry goes to the service as given.
 - **Owner and change tracking** are not checked (see the table above).
 - **Every call is a POST,** including the read of the layer JSON, so the token stays out of the URL.
   I did not confirm against Esri's pages that every resource accepts POST.
@@ -276,6 +303,47 @@ Not exercised against a real service: everything listed under Limits.
 - **Python 3.9** is checked by parsing the file with `feature_version=(3, 9)`. I ran it on 3.12 and
   3.13 only.
 - **Branch coverage is 100 percent,** so no line is unreached offline.
+
+Edge cases that I know about and have not fixed. Each is one sentence.
+
+- Check mode does not check integer ranges (a value too big for a SmallInteger passes), coded-value
+  domains or geometry validity, so "Check passed" does not guarantee that the service accepts every
+  row. A rejected row fails at staging, the batch is removed, and the run exits `3`.
+- Spatial reference is not compared and geometry goes to the service as given, so a source in one
+  coordinate system loads into a layer in another, and the tool reports the swap as verified because it counts rows only.
+- The tool does not model the field types GUID, GlobalID, Blob, DateOnly, TimeOnly and
+  TimestampOffset, so any source value for them goes to the service as given.
+- A required field that has a `defaultValue` is accepted when the column is absent everywhere, but
+  refused ("null in a field that does not allow null") when the column exists and one row omits it.
+- Python's `int()` and `float()` accept `1_000` and non-ASCII digits, so a CSV cell `1_000` is
+  written as `1000` in a whole-number field.
+- A JSON number such as `5.0` in a whole-number field is refused as "not a whole number", which may
+  surprise you with a pandas export.
+- A flat JSON attribute object that has a key named `attributes` is read as an Esri feature wrapper.
+- A server that ignores `resultOffset` while it reports `supportsPagination` as true can return
+  duplicate object ids. The tool does not remove them, and the live count after the flip then fails
+  the run with exit `3`.
+- A live service may behave differently from the stub. I did not confirm that a live service accepts
+  adds with no geometry, that the layer JSON answers a POST, or the exact shape of live replies.
+- The live count after the flip counts rows. It does not check which rows are live.
+- `--discard-staged` deletes the staged rows of every batch, so do not run two flips against one
+  table at the same time. It also fails ("batch id already exists") when you re-run it with the
+  same explicit `--batch-id` as a run that failed part way. Use a new batch id.
+- `urllib` follows redirects. A 301, 302 or 303 turns the POST into a GET with no body, so the
+  reply is an error and the run refuses. A 307 or 308 raises an error, so the token does not follow
+  a redirect to another host.
+- The tool prints text unescaped. On a Windows console or pipe that uses `cp1252`, a column name or
+  a server message with a character outside that code page raises `UnicodeEncodeError`. Set
+  `PYTHONUTF8=1` to avoid it.
+- `--token-env` shows its value in the usage error "needs a token in $NAME", so never give it the
+  token itself.
+- A bug in the tool before the first write ends in a Python traceback with exit `1`, the same code
+  as a refusal.
+- The sample run above cannot be replayed from the shipped files, because the stub exists only
+  inside `--self-test`. Its lines come from the tool's own log formats.
+- The mutation sweep that I ran by hand did not cover these boundaries: the row numbers in parse
+  errors, `json.dumps(allow_nan=False)`, `length > 0` in the string check and the guard on the
+  retry sleep. Messages and boundaries there are not pinned.
 
 ## Contributing
 
