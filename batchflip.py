@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""batchflip - swap a hosted table's contents in one visible step, with preconditions.
+"""batchflip - swap a hosted table's contents without ever emptying it, with preconditions.
 
 The usual nightly job empties a hosted table and appends the new rows. For minutes
 every reader sees an empty or half-filled table, and when the append fails the table
@@ -13,9 +13,10 @@ batch state. The tool does three things, in this order:
     3. retire   set the previous live rows to 'retired'
 
 Readers filter on the state column (batch_state = 'live'), so they see one complete
-batch. When the new and old rows together fit in one chunk, promote and retire go out
-in one applyEdits call. Above one chunk the tool promotes first and retires second, so
-a reader can briefly see both batches (duplicates), never an empty table.
+batch. When the new and old rows together fit in one chunk (--chunk, default 500),
+promote and retire go out in one applyEdits call, which is the one visible step. Above
+one chunk the tool promotes first and retires second, so a reader can briefly see both
+batches (duplicates), never an empty table.
 
 Before it writes anything the tool runs the overwrite preconditions (the ovwcheck
 checks). It refuses when the layer is a view, has sync enabled, lacks an edit
@@ -27,7 +28,7 @@ never be logged as success.
     python batchflip.py --self-test
     python batchflip.py --layer-url https://host/arcgis/rest/services/X/FeatureServer/0 --source rows.json
     python batchflip.py --layer-url ... --source rows.csv --apply
-    python batchflip.py --layer-url ... --recover 20260101T020000Z --apply
+    python batchflip.py --layer-url ... --recover 20260101T020000Z --expect-rows 480 --apply
 
 Dry run by default. Only --apply writes. The token comes from the environment
 (ARCGIS_TOKEN by default), never from the command line.
@@ -222,6 +223,43 @@ def geometry_kind(geom):
     return None
 
 
+def _wkids(sr):
+    """The well-known ids (wkid and latestWkid) that a spatialReference object names."""
+    if not isinstance(sr, dict):
+        return set()
+    return set(sr[k] for k in ("wkid", "latestWkid")
+               if isinstance(sr.get(k), int) and not isinstance(sr.get(k), bool))
+
+
+def layer_srs(props):
+    """The layer's spatial reference object, or None when the layer JSON names none.
+
+    Esri shows it inside `extent` on the Feature layer page.
+    """
+    for holder in (props.get("extent"), props):
+        sr = holder.get("spatialReference") if isinstance(holder, dict) else None
+        if isinstance(sr, dict) and sr:
+            return sr
+    return None
+
+
+def sr_same(a, b):
+    """True when two spatialReference objects are the same system. Compares wkid and
+    latestWkid (102100 and 3857 share latestWkid 3857), then wkt text when neither has an id."""
+    ids_a, ids_b = _wkids(a), _wkids(b)
+    if ids_a and ids_b:
+        return bool(ids_a & ids_b)
+    wkt = a.get("wkt") if isinstance(a, dict) else None
+    return isinstance(wkt, str) and bool(wkt) and wkt == b.get("wkt")
+
+
+def sr_text(sr):
+    ids = sorted(_wkids(sr))
+    if ids:
+        return "wkid " + "/".join(str(i) for i in ids)
+    return "wkt" if isinstance(sr, dict) and sr.get("wkt") else "an unreadable spatial reference"
+
+
 def _reject_constant(name):
     raise ValueError("%s is not valid JSON for a feature service" % name)
 
@@ -234,6 +272,11 @@ def _parse_json(text):
     items = doc.get("features") if isinstance(doc, dict) else doc
     if not isinstance(items, list):
         raise SourceError("JSON source must be a list or an object with a 'features' list")
+    if isinstance(doc, dict) and doc.get("exceededTransferLimit") is True:
+        raise SourceError("source says exceededTransferLimit is true: it is a cut-off query "
+                          "result, and swapping it in would drop the rows that were not returned")
+    # An envelope spatialReference covers every geometry that names none of its own.
+    env_sr = doc.get("spatialReference") if isinstance(doc, dict) else None
     rows, geoms = [], []
     for number, item in enumerate(items, 1):
         if not isinstance(item, dict):
@@ -244,6 +287,8 @@ def _parse_json(text):
             attrs, geom = item, None
         if not isinstance(attrs, dict):
             raise SourceError("row %d: attributes is not an object" % number)
+        if env_sr is not None and isinstance(geom, dict) and "spatialReference" not in geom:
+            geom = dict(geom, spatialReference=env_sr)
         rows.append(attrs)
         geoms.append(geom)
     return rows, geoms
@@ -399,7 +444,7 @@ def coerce_cell(value, field, csv_mode):
 
 
 def prepare_rows(props, rows, geoms, batch_field, state_field, csv_mode, allow_empty,
-                 allow_no_geometry=False):
+                 allow_no_geometry=False, allow_unstated_srs=False):
     """Compare the source with the layer. Returns (problems, clean) where clean is a
     list of (attributes keyed by the layer's own field names, geometry or None)."""
     if not rows:
@@ -460,7 +505,10 @@ def prepare_rows(props, rows, geoms, batch_field, state_field, csv_mode, allow_e
     for (col, reason), (count, first) in sorted(bad.items()):
         problems.append("column %s: %d value(s) %s (first at row %d)" % (col, count, reason, first))
     layer_kind = props.get("geometryType")
-    unknown_geo = mismatch = missing = nonfinite = 0
+    layer_sr = layer_srs(props)
+    unknown_geo = mismatch = missing = nonfinite = unstated = 0
+    wrong_sr = set()
+    wrong_sr_count = 0
     for _attrs, geom in clean:
         if geom is None:
             missing += 1
@@ -472,6 +520,13 @@ def prepare_rows(props, rows, geoms, batch_field, state_field, csv_mode, allow_e
             mismatch += 1
         elif not _finite(geom):
             nonfinite += 1
+        elif layer_sr is not None:
+            sr = geom.get("spatialReference")
+            if sr is None:
+                unstated += 1
+            elif not sr_same(sr, layer_sr):
+                wrong_sr_count += 1
+                wrong_sr.add(sr_text(sr))
     if missing and layer_kind and not allow_no_geometry:
         problems.append("%d row(s) have no geometry, and the layer holds %s; a CSV has none "
                         "(pass --allow-no-geometry to load them anyway)" % (missing, layer_kind))
@@ -483,6 +538,15 @@ def prepare_rows(props, rows, geoms, batch_field, state_field, csv_mode, allow_e
     if mismatch:
         problems.append("%d geometry value(s) do not match the layer's %s"
                         % (mismatch, layer_kind or "table (no geometry)"))
+    if wrong_sr_count:
+        problems.append("%d geometry value(s) use %s, but the layer uses %s; the tool does not "
+                        "reproject" % (wrong_sr_count, ", ".join(sorted(wrong_sr)),
+                                       sr_text(layer_sr)))
+    if unstated and not allow_unstated_srs:
+        problems.append("%d geometry value(s) name no spatial reference, and the layer uses %s; "
+                        "coordinates in another system would load unchanged (pass "
+                        "--allow-unstated-srs if they already use it)"
+                        % (unstated, sr_text(layer_sr)))
     return problems, clean
 
 
@@ -512,7 +576,8 @@ def state_refusals(live_rows, layer, staged_count, invalid_count, collision_coun
                         "before the first run" % (invalid_count, layer.state))
     if staged_count and not discard_staged:
         refusals.append("%d staged row(s) are left from an earlier run; pass --discard-staged "
-                        "to remove them, or --recover BATCH to finish that run"
+                        "to remove them. Use --recover BATCH --expect-rows N only when you know "
+                        "that batch is complete; a batch whose staging failed is not"
                         % staged_count)
     if collision_count:
         refusals.append("batch id already exists in the table (%d row(s))" % collision_count)
@@ -594,7 +659,12 @@ def arg_problems(args):
         out.append("--chunk must be 1 or more")
     if bool(args.source) == bool(args.recover):
         out.append("give exactly one of --source and --recover")
+    if args.expect_rows is not None and not args.recover:
+        out.append("--expect-rows goes with --recover only")
     if args.recover:
+        if args.expect_rows is None or args.expect_rows < 1:
+            out.append("--recover needs --expect-rows N, the row count of the whole batch "
+                       "(N is 1 or more)")
         if not BATCH_RE.match(args.recover):
             out.append("--recover needs a batch id of letters, digits, '_', '.', '-'")
         if args.batch_id or args.discard_staged or args.allow_empty:
@@ -676,27 +746,29 @@ def _abandon(layer, batch_id, stage, exc):
         exc = "%s: %s" % (type(exc).__name__, exc)
     try:
         gone = delete_rows(layer, where_batch(layer, batch_id, STAGED))
-        tail = "removed %d staged row(s) of the failed batch" % gone
+        tail = "removed %d staged row(s) of the failed batch %s" % (gone, batch_id)
     except BatchflipError as exc2:
-        tail = "cleanup failed too (%s); run with --discard-staged" % exc2
+        tail = ("cleanup failed too (%s); the staged rows of batch %s are incomplete, so run "
+                "with --discard-staged and do not use --recover on them" % (exc2, batch_id))
     return FlipError(stage, "%s; %s" % (exc, tail))
 
 
-def finish_flip(layer, new_oids, old_oids, expected_live, log):
+def finish_flip(layer, batch_id, new_oids, old_oids, batch_rows, log):
+    """Promote new_oids, retire old_oids, then check that batch_rows rows are live."""
     for label, updates in plan_flip(new_oids, old_oids, layer):
         try:
             apply_edits(layer, "updates", updates)
         except BatchflipError as exc:
             raise FlipError("flip", "%s failed: %s. Readers may see both batches. Finish with "
-                            "--recover BATCH" % (label, exc))
+                            "--recover %s --expect-rows %d" % (label, exc, batch_id, batch_rows))
         log("  %s: %d row(s)" % (label, len(updates)))
     try:
         live = fetch_count(layer, where_state(layer, LIVE))
     except BatchflipError as exc:
         raise FlipError("verify", "could not count live rows after the flip: %s" % exc)
-    if live != expected_live:
+    if live != batch_rows:
         raise FlipError("verify", "expected %d live row(s) after the flip, found %d"
-                        % (expected_live, live))
+                        % (batch_rows, live))
     log("  verified: %d live row(s)" % live)
 
 
@@ -725,7 +797,7 @@ def swap(layer, features, batch_id, old_oids, discard_staged, purge, log):
     except Exception as exc:  # any failure here leaves a half-staged batch to remove
         raise _abandon(layer, batch_id, "stage", exc)
     log("  staged %d row(s) as batch %s" % (len(new_oids), batch_id))
-    finish_flip(layer, new_oids, old_oids, len(new_oids), log)
+    finish_flip(layer, batch_id, new_oids, old_oids, len(new_oids), log)
     if purge:
         purge_retired(layer, log)
 
@@ -753,7 +825,9 @@ def run(args, log=print):
     problems = arg_problems(args)
     token = (os.environ.get(args.token_env) or "").strip()
     if args.apply and not token:
-        problems.append("--apply needs a token in $%s" % args.token_env)
+        # Never echo args.token_env: a caller may have passed the token itself.
+        problems.append("--apply needs a token in the environment variable that --token-env "
+                        "names (default ARCGIS_TOKEN)")
     if problems:
         _report(["error: " + p for p in problems], sys.stderr)
         return EXIT_USAGE
@@ -779,6 +853,9 @@ def _open_layer(args, token, log):
     layer = Layer(args.layer_url.rstrip("/"), token, props["objectIdField"],
                   by_name[args.batch_field.lower()]["name"],
                   by_name[args.state_field.lower()]["name"], args.chunk, page_size(props))
+    if props.get("geometryType") and layer_srs(props) is None:
+        warnings.append("layer JSON names no spatial reference, so the coordinates in the "
+                        "source cannot be compared with the layer")
     for line in warnings:
         log("warning: " + line)
     return layer, props
@@ -796,7 +873,8 @@ def _run(args, token, log):
         return _recover(args, layer, live_rows, log)
     rows, geoms, kind = read_source(args.source)
     problems, clean = prepare_rows(props, rows, geoms, layer.batch, layer.state,
-                                   kind == "csv", args.allow_empty, args.allow_no_geometry)
+                                   kind == "csv", args.allow_empty, args.allow_no_geometry,
+                                   args.allow_unstated_srs)
     batch_id = args.batch_id or default_batch_id(_NOW())
     problems += state_refusals(
         live_rows, layer, staged_count, fetch_count(layer, where_invalid(layer)),
@@ -818,9 +896,9 @@ def _run(args, token, log):
     return EXIT_OK
 
 
-def _recover_apply(args, layer, staged_rows, old, expected_live, log):
-    finish_flip(layer, oid_list(staged_rows, layer.oid), oid_list(old, layer.oid),
-                expected_live, log)
+def _recover_apply(args, layer, staged_rows, old, log):
+    finish_flip(layer, args.recover, oid_list(staged_rows, layer.oid), oid_list(old, layer.oid),
+                args.expect_rows, log)
     if args.purge:
         purge_retired(layer, log)
 
@@ -833,6 +911,14 @@ def _recover(args, layer, live_rows, log):
     if not staged_rows and not live_keep:
         _report(["REFUSED: batch %s has no staged or live rows in this layer" % keep])
         return EXIT_REFUSED
+    held = len(staged_rows) + len(live_keep)
+    if held != args.expect_rows:
+        # A batch whose staging failed is incomplete; promoting it would publish a partial table.
+        _report(["REFUSED: batch %s holds %d row(s) (%d staged, %d live) but --expect-rows says "
+                 "%d; a batch that is not complete must not be recovered (use --discard-staged "
+                 "on the next run)" % (keep, held, len(staged_rows), len(live_keep),
+                                       args.expect_rows)])
+        return EXIT_REFUSED
     log("recover batch %s: %d staged to promote, %d live batch row(s) to retire"
         % (keep, len(staged_rows), len(old)))
     if not args.apply:
@@ -840,8 +926,7 @@ def _recover(args, layer, live_rows, log):
         log("Re-run with --apply to finish the flip.")
         return EXIT_OK
     log("=== APPLY ===")
-    _guarded(_recover_apply, args, layer, staged_rows, old, len(live_keep) + len(staged_rows),
-             log)
+    _guarded(_recover_apply, args, layer, staged_rows, old, log)
     log("Done.")
     return EXIT_OK
 
@@ -849,14 +934,17 @@ def _recover(args, layer, live_rows, log):
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="batchflip.py", allow_abbrev=False,
-        description="Swap a hosted table's contents in one visible step, with overwrite "
-                    "preconditions.",
+        description="Swap a hosted table's contents without ever emptying it, with "
+                    "overwrite preconditions.",
         epilog="Dry run by default. Only --apply writes. The token comes from the "
                "environment, never the command line.")
     ap.add_argument("--layer-url", help="https://host/arcgis/rest/services/X/FeatureServer/0")
     ap.add_argument("--source", help="new rows: Esri JSON features (.json) or a .csv")
     ap.add_argument("--recover", metavar="BATCH",
                     help="finish an interrupted flip: promote BATCH, retire every other live batch")
+    ap.add_argument("--expect-rows", type=int, metavar="N",
+                    help="with --recover: row count of the whole batch; the run refuses when "
+                         "the table holds a different number")
     ap.add_argument("--batch-id", help="id for the new batch (default: UTC timestamp)")
     ap.add_argument("--batch-field", default=DEFAULT_BATCH_FIELD,
                     help="text column holding the batch id (default %s)" % DEFAULT_BATCH_FIELD)
@@ -874,6 +962,9 @@ def build_parser():
                     help="allow a source with no rows (this empties the table)")
     ap.add_argument("--allow-no-geometry", action="store_true",
                     help="allow rows with no geometry in a layer that has a geometry type")
+    ap.add_argument("--allow-unstated-srs", action="store_true",
+                    help="allow geometries that name no spatial reference in a layer that "
+                         "reports one (they must already use the layer's)")
     ap.add_argument("--allow-sync", action="store_true",
                     help="allow a layer that has sync enabled")
     ap.add_argument("--token-env", default="ARCGIS_TOKEN",
@@ -1140,6 +1231,24 @@ def _t_core(check, raises):
     check(geometry_kind({"rings": []}) == "esriGeometryPolygon", "a polygon is recognised")
     check(geometry_kind({"xmin": 1}) is None, "an envelope is not a feature geometry")
     check(geometry_kind("POINT(1 2)") is None, "a text geometry is not recognised")
+    check(geometry_kind("xyz") is None, "a text that contains a geometry key letter is not a geometry")
+    s3857 = {"wkid": 102100, "latestWkid": 3857}
+    check(sr_same({"wkid": 3857}, s3857) and sr_same({"wkid": 102100}, s3857),
+          "wkid and latestWkid are compared, so 102100 and 3857 are the same system")
+    check(not sr_same({"wkid": 4326}, s3857), "two different well-known ids are different systems")
+    check(sr_same({"wkt": "W"}, {"wkt": "W"}) and not sr_same({"wkt": "W"}, {"wkt": "V"}),
+          "two spatial references with no id are compared by their wkt text")
+    check(not sr_same({"wkt": "W"}, {"wkid": 4326}) and not sr_same({}, {}) and not sr_same("x", {"wkt": "W"}),
+          "a wkt against a wkid, an empty object and a non-object are never the same")
+    check(not sr_same({"wkid": True}, {"wkid": 1}), "a boolean wkid is not an id")
+    check(sr_text(s3857) == "wkid 3857/102100" and sr_text({"wkt": "W"}) == "wkt"
+          and sr_text("x") == "an unreadable spatial reference", "sr_text names the system")
+    check(layer_srs({"extent": {"spatialReference": {"wkid": 4326}}}) == {"wkid": 4326},
+          "the layer's spatial reference is read from its extent")
+    check(layer_srs({"spatialReference": {"wkid": 4326}}) == {"wkid": 4326},
+          "a top level layer spatialReference is read when there is no extent")
+    check(layer_srs({}) is None and layer_srs({"extent": 5, "spatialReference": {}}) is None,
+          "a layer that names no spatial reference gives None")
 
     # ---- layer url
     check(url_problem(_HOST) is None, "an https layer url is accepted")
@@ -1180,6 +1289,18 @@ def _t_source(check, raises, tmp):
     raises(lambda: parse_source("[1]", "json"), "a row that is not an object raises", SourceError)
     raises(lambda: parse_source('[{"attributes": 3}]', "json"),
            "attributes that are not an object raise", SourceError)
+    rows, geoms = parse_source(json.dumps({
+        "spatialReference": {"wkid": 3857},
+        "features": [_feat(1), _feat(2, geom=False),
+                     {"attributes": {"CODE": 3},
+                      "geometry": {"x": 1, "y": 1, "spatialReference": {"wkid": 4326}}}]}), "json")
+    check(geoms[0]["spatialReference"] == {"wkid": 3857} and geoms[1] is None
+          and geoms[2]["spatialReference"] == {"wkid": 4326},
+          "an envelope spatialReference reaches every geometry that names none  <-- pinned defect")
+    raises(lambda: parse_source('{"exceededTransferLimit": true, "features": []}', "json"),
+           "a cut-off query result (exceededTransferLimit) is refused  <-- pinned defect", SourceError)
+    rows, geoms = parse_source('{"exceededTransferLimit": false, "features": [{"CODE": 1}]}', "json")
+    check(len(rows) == 1, "exceededTransferLimit false is an ordinary source")
     rows, geoms = parse_source("NAME,CODE\na,1\n\nb,2\n", "csv")
     check(rows == [{"NAME": "a", "CODE": "1"}, {"NAME": "b", "CODE": "2"}],
           "a csv parses and skips blank lines")
@@ -1286,6 +1407,10 @@ def _t_layer(check):
     check(coerce_cell("x", dbl, True)[1] == "not a number", "csv text that is not a number is named")
     txt = {"type": T_STRING, "length": 3, "nullable": True}
     check(coerce_cell("abc", txt, False) == ("abc", None), "text at the field length fits")
+    one = {"type": T_STRING, "length": 1}
+    check(coerce_cell("a", one, False) == ("a", None)
+          and coerce_cell("ab", one, False)[1] == "longer than the field length",
+          "text over a field length of 1 is refused")
     check(coerce_cell("abcd", txt, False)[1] == "longer than the field length",
           "text over the field length is refused")
     check(coerce_cell(5, txt, False)[1] == "not text", "a number is not text")
@@ -1369,6 +1494,28 @@ def _t_rows(check):
     table = _stub_props(table=True)
     problems, _ = prep(good, geo, p=table)
     check("table (no geometry)" in problems[0], "geometry into a table is refused")
+
+    # ---- spatial reference
+    sp = _stub_props()
+    sp["extent"] = {"spatialReference": {"wkid": 102100, "latestWkid": 3857}}
+
+    def sprep(srs, **kw):
+        geoms3 = [dict({"x": 1, "y": 1}, **({} if s_ is None else {"spatialReference": s_}))
+                  for s_ in srs]
+        return prepare_rows(sp, [good[0]] * len(srs), geoms3, "batch_id", "batch_state",
+                            False, False, **kw)[0]
+
+    check(sprep([{"wkid": 3857}, {"latestWkid": 3857}]) == [], "geometry in the layer's own system passes")
+    check(sprep([{"wkid": 4326}, {"wkid": 4326}, {"wkt": "W"}]) == [
+        "3 geometry value(s) use wkid 4326, wkt, but the layer uses wkid 3857/102100; the tool does "
+        "not reproject"], "geometry in another system is refused and the systems are named  <-- pinned defect")
+    check(sprep(["junk"])[0].startswith("1 geometry value(s) use an unreadable spatial reference"),
+          "a spatial reference that is not an object is refused")
+    check("name no spatial reference" in sprep([None, {"wkid": 3857}])[0] and len(sprep([None])) == 1,
+          "geometry that names no spatial reference is refused when the layer names one  <-- pinned defect")
+    check(sprep([None], allow_unstated_srs=True) == [], "--allow-unstated-srs accepts it")
+    check(sprep([None, {"wkid": 4326}], allow_unstated_srs=True)[0].startswith("1 geometry value(s) use wkid 4326"),
+          "--allow-unstated-srs does not excuse a geometry in another system")
     problems, clean = prep([{"CODE": "7", "NAME": "", "SCORE": "2.5"}], p=table, csv_mode=True)
     check(problems == [] and clean[0][0] == {"CODE": 7, "NAME": None, "SCORE": 2.5},
           "csv rows are coerced to the layer's field types")
@@ -1453,13 +1600,18 @@ def _t_rows(check):
     check("exactly one" in arg_problems(_args(*base))[0], "neither --source nor --recover is a usage problem")
     check("exactly one" in arg_problems(_args(*base + ["--source", "a", "--recover", "B"]))[0],
           "both --source and --recover is a usage problem")
-    check(arg_problems(_args(*base + ["--recover", "B1"])) == [], "a recover run has no usage problems")
-    check("letters, digits" in arg_problems(_args(*base + ["--recover", "B 1"]))[0],
+    check(arg_problems(_args(*base + ["--recover", "B1", "--expect-rows", "1"])) == [], "a recover run has no usage problems")
+    check("letters, digits" in arg_problems(_args(*base + ["--recover", "B 1", "--expect-rows", "1"]))[0],
           "a recover id with a space is refused")
-    check("cannot be combined" in arg_problems(_args(*base + ["--recover", "B1", "--batch-id", "B2"]))[0],
+    check("cannot be combined" in arg_problems(_args(*base + ["--recover", "B1", "--expect-rows", "1", "--batch-id", "B2"]))[0],
           "--recover with --batch-id is refused")
-    check("cannot be combined" in arg_problems(_args(*base + ["--recover", "B1", "--allow-empty"]))[0],
+    check("cannot be combined" in arg_problems(_args(*base + ["--recover", "B1", "--expect-rows", "1", "--allow-empty"]))[0],
           "--recover with --allow-empty is refused")
+    check("--expect-rows N" in arg_problems(_args(*base + ["--recover", "B1"]))[0]
+          and "--expect-rows N" in arg_problems(_args(*base + ["--recover", "B1", "--expect-rows", "0"]))[0],
+          "--recover without a positive --expect-rows is refused  <-- pinned defect")
+    check("goes with --recover only" in arg_problems(_args(*base + ["--source", "a", "--expect-rows", "3"]))[0],
+          "--expect-rows without --recover is refused")
     check("--batch-id must be" in arg_problems(_args(*base + ["--source", "a", "--batch-id", "x'y"]))[0],
           "a batch id with a quote is refused  <-- pinned defect")
     check("--batch-id must be" in arg_problems(_args(*base + ["--source", "a", "--batch-id", "x" * 41]))[0],
@@ -1481,7 +1633,7 @@ def _t_rows(check):
           "the same column for batch and state is refused")
     check(build_parser().parse_args(["--apply"]).apply is True, "--apply sets the write flag")
     check(build_parser().parse_args([]).apply is False, "the write flag is off by default")
-    for prefix in ("--ap", "--app", "--appl", "--sourc", "--recov", "--dis"):
+    for prefix in ("--ap", "--app", "--appl", "--sourc", "--recov", "--dis", "--expect", "--allow-unst"):
         code, _out, err = _cli(["--layer-url", _HOST, prefix, "x"])
         check(code == 2 and "ambiguous" not in err and "unrecognized arguments" in err,
               "a prefix %s of a flag is REFUSED by the parser  <-- pinned defect" % prefix)
@@ -1491,7 +1643,7 @@ def _t_rows(check):
 
 def _t_net(check, tmp):
     """Everything below talks real HTTP to the stub on 127.0.0.1."""
-    global _SLEEP, _NOW, plan_flip
+    global _SLEEP, _NOW, plan_flip, _HTTP
     real_plan = plan_flip
     stub = _Stub()
     server, thread = _serve(stub)
@@ -1654,6 +1806,25 @@ def _t_net(check, tmp):
         check(failed is not None and "locked" in failed, "a failed delete result is reported")
         check(len(stub.rows) == before + 1, "a failed delete leaves the row in place")
         stub.rows.pop()
+        real_http, attempts = _HTTP, []
+
+        def flaky(target, params, retries):
+            if target.endswith("/deleteFeatures"):
+                attempts.append(retries)
+                raise RestError("planned")
+            return real_http(target, params, retries)
+
+        _HTTP = flaky
+        try:
+            stub.rows.append({"OBJECTID": 778, "batch_id": "Q", "batch_state": RETIRED})
+            try:
+                delete_rows(layer, "batch_id = 'Q'")
+            except RestError:
+                pass
+        finally:
+            _HTTP = real_http
+        check(attempts == [1], "a deleteFeatures call is sent once and never retried  <-- pinned defect")
+        stub.rows.pop()
 
         # ---- first load: a dry run, then the write
         stub.reset(0)
@@ -1756,15 +1927,15 @@ def _t_net(check, tmp):
         stub.seed(2, "Z", LIVE)
         refused(["--source", src3, "--batch-id", "N2", "--apply"], "2 batches are live",
                 "two live batches refuse the next run")
-        refused(["--recover", "Q9"], "has no staged or live rows", "recovering an unknown batch refuses")
+        refused(["--recover", "Q9", "--expect-rows", "1"], "has no staged or live rows", "recovering an unknown batch refuses")
         mark = writes()
-        code, out, err = cli("--layer-url", url, "--recover", "B3")
+        code, out, err = cli("--layer-url", url, "--recover", "B3", "--expect-rows", "3")
         check(code == 0 and "0 staged to promote, 2 live batch row(s) to retire" in out and writes() == mark
               and "Check passed" in out, "a recover check run reports the plan and writes nothing")
-        code, out, err = cli("--layer-url", url, "--recover", "B3", "--apply")
+        code, out, err = cli("--layer-url", url, "--recover", "B3", "--expect-rows", "3", "--apply")
         check(code == 0 and stub.number(LIVE, "B3") == 3 and stub.number(LIVE) == 3 and stub.number(RETIRED, "Z") == 2,
               "--recover retires every other live batch")
-        code, out, err = cli("--layer-url", url, "--recover", "B3", "--apply")
+        code, out, err = cli("--layer-url", url, "--recover", "B3", "--expect-rows", "3", "--apply")
         check(code == 0 and "0 staged to promote, 0 live batch row(s) to retire" in out and stub.number(LIVE) == 3,
               "recovering a batch that is already the only live batch changes nothing")
         stub.add({"CODE": 1, "NAME": "x"})
@@ -1791,6 +1962,16 @@ def _t_net(check, tmp):
         code, out, err = cli("--layer-url", url, "--source", src3, "--apply")
         check(code == 64 and "needs a token" in err and writes() == mark,
               "--apply without a token is a usage error  <-- pinned defect")
+        os.environ["ARCGIS_TOKEN"] = _TOKEN
+        code, out, err = cli("--layer-url", url, "--source", src3, "--apply", "--token-env", _TOKEN)
+        check(code == 64 and "needs a token" in err and _TOKEN not in out + err and writes() == mark,
+              "a token passed as the --token-env value is never echoed  <-- pinned defect")
+        os.environ["ARCGIS_TOKEN"] = ""
+        os.environ["BF_TOK"] = _TOKEN
+        code, out, err = cli("--layer-url", url, "--source", src3, "--token-env", "BF_TOK")
+        check(code == 0 and "Check passed" in out, "--token-env reads the token from the variable it names")
+        os.environ.pop("BF_TOK")
+        os.environ["ARCGIS_TOKEN"] = ""
         os.environ["ARCGIS_TOKEN"] = "wrong-token-777"
         code, out, err = cli("--layer-url", url, "--source", src3)
         check(code == 1 and "Invalid token" in err and "wrong-token-777" not in out + err,
@@ -1824,6 +2005,39 @@ def _t_net(check, tmp):
         refused(["--source", src("inf.json", '[{"attributes": {"CODE": 1}, "geometry": {"x": 1e999, "y": 1}}]'),
                  "--apply"], "not finite",
                 "a coordinate that overflows to infinity refuses before any write  <-- pinned defect")
+
+        # ---- spatial reference, through the whole tool
+        stub.props["extent"] = {"spatialReference": {"wkid": 4326}}
+
+        def sr_src(name, srs, extra=None, geom=True):
+            doc = {"features": [_feat(i, geom) for i in range(3)]}
+            if srs is not None:
+                doc["spatialReference"] = srs
+            doc.update(extra or {})
+            return src(name, json.dumps(doc))
+
+        stub.reset(5, "B3")
+        refused(["--source", sr_src("w3857.json", {"wkid": 3857}), "--apply"], "use wkid 3857",
+                "a source in another coordinate system refuses and writes nothing  <-- pinned defect")
+        refused(["--source", sr_src("nosr.json", None), "--apply"], "name no spatial reference",
+                "a source that names no spatial reference refuses when the layer names one  <-- pinned defect")
+        refused(["--source", sr_src("cut.json", {"wkid": 4326}, {"exceededTransferLimit": True}), "--apply"],
+                "exceededTransferLimit",
+                "a cut-off query result refuses and keeps the live rows  <-- pinned defect")
+        check(stub.number(LIVE, "B3") == 5 and len(stub.rows) == 5, "the live rows survive those refusals")
+        code, out, err = cli("--layer-url", url, "--source", sr_src("w4326.json", {"wkid": 4326}),
+                             "--batch-id", "S1", "--apply")
+        check(code == 0 and stub.number(LIVE, "S1") == 3
+              and all(stub.geoms[r["OBJECTID"]].get("spatialReference") == {"wkid": 4326}
+                      for r in stub.rows if r.get("batch_id") == "S1"),
+              "a source in the layer's own system loads and sends its spatialReference")
+        code, out, err = cli("--layer-url", url, "--source", sr_src("nosr2.json", None),
+                             "--batch-id", "S2", "--allow-unstated-srs", "--apply")
+        check(code == 0 and stub.number(LIVE, "S2") == 3, "--allow-unstated-srs loads geometry that names none")
+        del stub.props["extent"]
+        code, out, err = cli("--layer-url", url, "--source", sr_src("w3857b.json", {"wkid": 3857}))
+        check(code == 0 and "warning: layer JSON names no spatial reference" in out,
+              "a layer that names no spatial reference is noted, and nothing is compared")
 
         # ---- faults while writing
         def fault(call_no, reply, args, label, needle, rows_after, code_want=3):
@@ -1887,10 +2101,20 @@ def _t_net(check, tmp):
         stub.canned[("applyEdits", n + 2)] = {"error": {"code": 500, "message": "boom"}}
         stub.canned[("deleteFeatures", stub.calls("deleteFeatures") + 1)] = {"error": {"code": 500, "message": "boom2"}}
         code, out, err = cli("--layer-url", url, "--source", src7, "--batch-id", "F3", "--chunk", "3", "--apply")
+        err0 = err
         check(code == 3 and "cleanup failed too" in err and stub.number(STAGED, "F3") == 3,
               "a failed cleanup is reported and the staged rows stay")
         refused(["--source", src3, "--batch-id", "F4", "--apply"], "staged row(s) are left",
                 "the next run refuses until the leftovers are dealt with")
+        check("batch F3 are incomplete" in err0 and "do not use --recover" in err0,
+              "the cleanup failure says the staged rows are incomplete and not to recover them")
+        mark = writes()
+        code, out, err = cli("--layer-url", url, "--recover", "F3", "--expect-rows", "7", "--apply")
+        check(code == 1 and "holds 3 row(s) (3 staged, 0 live) but --expect-rows says 7" in out
+              and writes() == mark and stub.number(STAGED, "F3") == 3 and stub.number(LIVE) == 0,
+              "--recover refuses a half-staged batch and changes nothing  <-- pinned defect")
+        code, out, err = cli("--layer-url", url, "--recover", "F3", "--expect-rows", "3")
+        check(code == 0 and "Check passed" in out, "--expect-rows that matches the staged rows passes the check")
         code, out, err = cli("--layer-url", url, "--source", src3, "--batch-id", "F4", "--discard-staged", "--apply")
         check(code == 0 and stub.number(LIVE, "F4") == 3 and len(stub.rows) == 3, "--discard-staged repairs it")
 
@@ -1929,9 +2153,20 @@ def _t_net(check, tmp):
         check(code == 3 and "promote chunk 2 failed" in err and "--recover" in err
               and stub.number(LIVE, "N7") == 3 and stub.number(STAGED, "N7") == 4 and stub.number(LIVE, "OLD") == 3,
               "a promote call that fails leaves both batches live and says how to finish")
-        code, out, err = cli("--layer-url", url, "--recover", "N7", "--chunk", "3", "--apply")
+        code, out, err = cli("--layer-url", url, "--recover", "N7", "--expect-rows", "7", "--chunk", "3", "--apply")
         check(code == 0 and stub.number(LIVE) == 7 and stub.number(LIVE, "N7") == 7 and stub.number(RETIRED, "OLD") == 3,
               "--recover promotes what is left and retires the old batch")
+
+        # the flip failure names the real batch id and the row count that --recover needs
+        stub.reset(3, "OLD")
+        n = stub.calls("applyEdits")
+        stub.canned[("applyEdits", n + 5)] = {"error": {"code": 500, "message": "boom"}}
+        code, out, err = cli("--layer-url", url, "--source", src7, "--batch-id", "N6", "--chunk", "3", "--apply")
+        check(code == 3 and "--recover N6 --expect-rows 7" in err,
+              "the flip failure message names the batch id and the row count, not the word BATCH")
+        code, out, err = cli("--layer-url", url, "--recover", "N6", "--expect-rows", "7", "--chunk", "3", "--apply")
+        check(code == 0 and stub.number(LIVE, "N6") == 7 and stub.number(LIVE) == 7,
+              "the command that the flip failure message prints finishes the flip")
 
         # a retire call fails, then --recover --purge finishes and cleans up
         stub.reset(3, "OLD")
@@ -1940,7 +2175,7 @@ def _t_net(check, tmp):
         code, out, err = cli("--layer-url", url, "--source", src3, "--batch-id", "N8", "--chunk", "4", "--apply")
         check(code == 3 and "retire chunk 1 failed" in err and stub.number(LIVE) == 6,
               "a retire call that fails leaves the new batch live beside the old one")
-        code, out, err = cli("--layer-url", url, "--recover", "N8", "--chunk", "4", "--purge", "--apply")
+        code, out, err = cli("--layer-url", url, "--recover", "N8", "--expect-rows", "3", "--chunk", "4", "--purge", "--apply")
         check(code == 0 and stub.number(LIVE) == 3 and stub.number(RETIRED) == 0 and len(stub.rows) == 3,
               "--recover with --purge retires and removes the old batch")
 
